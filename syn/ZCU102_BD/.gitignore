@@ -1,0 +1,9 @@
+#Ignore complete Vivado Directory
+/Vivado/**
+
+#Unignore Directories (Needed to unignore files in Subdirectories)
+!*/
+
+#WHITELIST
+#Vivado Project File
+!*.xpr

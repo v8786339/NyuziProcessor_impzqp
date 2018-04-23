@@ -1,0 +1,15 @@
+#IGNORE EVERYTHING
+*
+
+#FILE WHITELIST
+!*.tcl
+!*.txt
+!*.gitignore
+
+#FOLDER WHITELIST
+!ZCU102/
+!ZCU102/**
+!zedboard/
+!zedboard/**
+!ZCU102_BD/
+!ZCU102_BD/**

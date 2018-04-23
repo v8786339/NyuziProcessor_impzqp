@@ -1,0 +1,12 @@
+#Ignore everything
+*
+
+#FILE WHITELIST
+!*.hdf
+!.gitignore
+
+#DIRECTORY WHITELIST
+!GPU_BD_wrapper_hw_platform_0/
+!GPU_BD_wrapper_hw_platform_0/**
+!src/
+!src/**
