@@ -1,6 +1,19 @@
+# Credits
+
+This work was done as the course project for SoC Laboratory at the Institute of Computer Technology (ICT) at TU Wien, Vienna, Austria, by
+
+- Johannes Blatnik, e1325707@student.tuwien.ac.at
+- Ioannis Daktylidis, e1128193@student.tuwien.ac.at
+- Jonas Ferdigg, e1226597@student.tuwien.ac.at
+- Daniel Haslauer, e1026814@student.tuwien.ac.at
+- Markus Kessler, e1225380@student.tuwien.ac.at
+- Edwin Willegger, e1326324@student.tuwien.ac.at
+
+under supervision of Dr. Nima TaheriNejad. For questions or inquiries please contact one of the students (email addresses above) or nima.taherinejad@tuwien.ac.at.
+
 # First steps
 
-This project implements [Nyuzi](https://github.com/jbush001/NyuziProcessor) on a Xilinx Ultrascale+ ZCU102. Please refer to `doc/Documentation.pdf` for a precise documentation.
+This project implements [Nyuzi](https://github.com/jbush001/NyuziProcessor) on a Xilinx Ultrascale+ ZCU102. Please refer to `doc/Documentation.pdf` for a project documentation.
 
 The following steps are required to to build and use the software/hardware:
 
@@ -17,7 +30,7 @@ The following steps are required to to build and use the software/hardware:
 
 6) If you want to use the more functional `scene_viewer` application, you have to copy some scenes to the SD card too. Use the binary files from `../apps/cup`, `../apps/pinocchio`, `../apps/pyramide` and `../apps/luigi_circuit`.
 
-> Xilinxs SD card library doesn't support long filenames. It is recommended to use short names like `pino.bin`, `pyra.bin` and so on.
+> Xilinx's SD card library doesn't support long filenames. It is recommended to use short names like `pino.bin`, `pyra.bin` and so on.
 
 7) Get the hardware bitstream file
     1) This repo provides an already generated bitstream file ready to use. It is stored under the path `syn/ZCU102_BD/GPU_BD_wrapper.bit`.
