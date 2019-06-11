@@ -20,6 +20,7 @@
 #include "shared_mem_itf.hpp"
 #include "sdcard.hpp"
 #include "util.hpp"
+#include "snes.h"
 
 #define DEBUG           0
 
@@ -49,11 +50,15 @@
 /* GPIO instances of push_button, reset and leds/switches */
 XGpio gpio_push_buttons, gpio_reset, gpio_switches_leds;
 /* Instance of the Interrupt controller driver */
-XScuGic intc;
+XScuGic intc, intc2;
 /* The current and previous button press */
 extern u8 button_pressed, button_pressed_last, button_activation;
+/* The snes button pressed state */
+u32 snes_buttons_pressed;
 /* Use channel 1 for the interrupt */
 const u32 globalIntrMask = 0x01;
+/* Channel 2 for snes interrupt */
+const u32 globalIntrMaskSnes = 0x02;
 /* Pointer to the shared memory area */
 smdb_t* smdb = (smdb_t*)(SMDB_ADDR);
 /* A struct that models the content of a sdcard */
@@ -320,25 +325,28 @@ int init(void) {
     if (status != XST_SUCCESS) {
         log(DEBUG, "[main] Initializing GPIO push buttons...failed!\n\r");
         ret = XST_FAILURE;
+        return ret;
     }
-    log(DEBUG, "[main] Initalizing interrupt routine for push buttons...\n\r");
-    status = gpio_interrupt_init(&gpio_push_buttons, &intc, XPAR_SCUGIC_0_DEVICE_ID,
-            XPAR_FABRIC_AXI_GPIO_1_IP2INTC_IRPT_INTR, globalIntrMask, interrupt_handler);
-    if (status != XST_SUCCESS) {
-        log(DEBUG, "[main] Initalizing interrupt routine for push buttons...failed!\n\r");
-        ret = XST_FAILURE;
-    }
+    log(DEBUG, "[main] Initalizing interrupt routine for snes buttons...\n\r");
+        status = snes_interrupt_init(&intc2, XPAR_SCUGIC_0_DEVICE_ID, XPAR_FABRIC_SNES_0_BTN_CHANGE_INTR, snes_interrupt_handler);
+        if (status != XST_SUCCESS) {
+            log(DEBUG, "[main] Initalizing interrupt routine for snes buttons...failed!\n\r");
+            ret = XST_FAILURE;
+            return ret;
+        }
     log(DEBUG, "[main] Initializing GPIO reset...\n\r");
     status = XGpio_Initialize(&gpio_reset, XPAR_AXI_GPIO_0_DEVICE_ID);
     if (status != XST_SUCCESS) {
         log(DEBUG, "[main] Initializing GPIO reset...failed!\n\r");
         ret = XST_FAILURE;
+        return ret;
     }
     log(DEBUG, "[main] Initalizing GPIO switches and leds...\n\r");
     status = XGpio_Initialize(&gpio_switches_leds, XPAR_AXI_GPIO_2_DEVICE_ID);
     if (status != XST_SUCCESS) {
         log(DEBUG, "[main] Initalizing GPIO switches and leds...failed!\n\r");
         ret = XST_FAILURE;
+        return ret;
     }
 
     // Set the data direction for push_buttons (read), reset (write), switches (read) and leds (write)
@@ -427,7 +435,19 @@ void interrupt_handler(void *callback) {
     button_pressed = XGpio_DiscreteRead((XGpio *)callback, CHANNEL_PB);
     XGpio_InterruptClear((XGpio *)callback, globalIntrMask);
 
-    log(DEBUG, "[main] Received interrupt...\n\r");
+    log(DEBUG, "[main] Received gpio interrupt...\n\r");
+}
+
+/**
+* @brief            This is the interrupt handler when the state register of the snes controller changes
+* @param callback   is the snes callback reference for the handler.
+*/
+void snes_interrupt_handler(void *callback) {
+    // Read the current state of the buttons and clear the interrupt
+    snes_buttons_pressed = SNES_mReadReg(XPAR_SNES_0_S00_AXI_BASEADDR, 0);
+    XGpio_DiscreteWrite(&gpio_switches_leds, CHANNEL_LED, snes_buttons_pressed>>8);
+
+    log(DEBUG, "[main] Received snes interrupt...\n\r");
 }
 
 /**
