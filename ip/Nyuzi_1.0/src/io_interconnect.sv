@@ -14,7 +14,7 @@
 // limitations under the License.
 //
 
-`include "defines.sv"
+`include "defines.svh"
 
 import defines::*;
 
@@ -24,24 +24,24 @@ import defines::*;
 //
 
 module io_interconnect
-    #(
+#(
         parameter  C_M_IO_TARGET_SLAVE_BASE_ADDR    = 32'h00000000,
         parameter integer C_M_IO_AXI_ADDR_WIDTH    = 32,
         parameter integer C_M_IO_AXI_DATA_WIDTH    = 32
-    )
-    (
-        input                            clk,
-        input                            reset,
+)
+(
+    input                            clk,
+    input                            reset,
 
-        // From core
-        input [`NUM_CORES - 1:0]         ior_request_valid,
-        input ioreq_packet_t             ior_request[`NUM_CORES],
+    // From core
+    input [`NUM_CORES - 1:0]         ior_request_valid,
+    input ioreq_packet_t             ior_request[`NUM_CORES],
 
-        // To core
-        output logic                     ii_ready[`NUM_CORES],
-        output logic                     ii_response_valid,
-        output iorsp_packet_t            ii_response,
-//        io_bus_interface.master          io_bus,
+    // To core
+    output logic                     ii_ready[`NUM_CORES],
+    output logic                     ii_response_valid,
+    output iorsp_packet_t            ii_response,
+ //        io_bus_interface.master          io_bus,
         //M_IO_AXI
         output wire [C_M_IO_AXI_ADDR_WIDTH-1 : 0] m_io_axi_awaddr,
         output wire [2 : 0] m_io_axi_awprot,
@@ -66,11 +66,12 @@ module io_interconnect
 
     core_id_t grant_idx;
     logic[`NUM_CORES - 1:0] grant_oh;
-//    logic request_sent;
-//    core_id_t request_core;
-//    local_thread_idx_t request_thread_idx;
+    //logic request_sent;
+   // core_id_t request_core;
+  //  local_thread_idx_t request_thread_idx;
     ioreq_packet_t grant_request;
-    //AXI_LITE Signals
+
+      //AXI_LITE Signals
     logic [C_M_IO_AXI_ADDR_WIDTH-1 : 0] awaddr;
     logic  awvalid;
     logic [C_M_IO_AXI_DATA_WIDTH-1 : 0] wdata;
@@ -80,7 +81,7 @@ module io_interconnect
     logic axi_rready;
     logic axi_bready;
     
-    parameter FIFO_WIDTH_IN = ($bits(ior_request[0].is_store)+(MIN_WIDTH+1)+$bits(ior_request[0].thread_idx)+$bits(ior_request[0].address)+$bits(ior_request[0].value));
+    parameter FIFO_WIDTH_IN = ($bits(ior_request[0].store)+(MIN_WIDTH+1)+$bits(ior_request[0].thread_idx)+$bits(ior_request[0].address)+$bits(ior_request[0].value));
     parameter FIFO_WIDTH_OUT = ((MIN_WIDTH+1)+$bits(ii_response.thread_idx)+$bits(ii_response.read_value));
     parameter MIN_WIDTH = `NUM_CORES > 1 ? CORE_ID_WIDTH-1 : 0;
     
@@ -107,7 +108,7 @@ module io_interconnect
             .empty(in_empty),
             .write_en(in_write_en),
             .full(in_full),
-            .write_data({grant_request.is_store, grant_idx[MIN_WIDTH:0], grant_request.thread_idx, grant_request.address, grant_request.value})
+            .write_data({grant_request.store, grant_idx[MIN_WIDTH:0], grant_request.thread_idx, grant_request.address, grant_request.value})
         );
         
     fifo
@@ -121,7 +122,7 @@ module io_interconnect
             .empty(out_empty),
             .write_en(out_write_en),
             .full(out_full),
-            .write_data({in_data[$bits(in_data)-$bits(ior_request[0].is_store)-1 : $bits(in_data)-$bits(ior_request[0].is_store)-(MIN_WIDTH+1)-$bits(ior_request[0].thread_idx)], m_io_axi_rdata})
+            .write_data({in_data[$bits(in_data)-$bits(ior_request[0].store)-1 : $bits(in_data)-$bits(ior_request[0].store)-(MIN_WIDTH+1)-$bits(ior_request[0].thread_idx)], m_io_axi_rdata})
         );
     
 //    genvar i;
@@ -354,6 +355,7 @@ module io_interconnect
 //        end
 //    endgenerate
 
+    genvar grant_idx_bit;
     generate
         if (`NUM_CORES > 1)
         begin
@@ -367,16 +369,13 @@ module io_interconnect
                 .one_hot(grant_oh),
                 .index(grant_idx[CORE_ID_WIDTH - 1:0]));
 
-            // XXX hack. Ensure high bits are initialized. Notes in defines.sv
+            // Ensure high bits are zeroed. Notes in defines.sv
             // describe why the core ID width needs to be hardcoded.
-            if (`NUM_CORES <= 8)
-                assign grant_idx[3] = 0;
-
-            if (`NUM_CORES <= 4)
-                assign grant_idx[2] = 0;
-
-            if (`NUM_CORES <= 2)
-                assign grant_idx[1] = 0;
+            for (grant_idx_bit = CORE_ID_WIDTH; grant_idx_bit < $bits(grant_idx);
+                grant_idx_bit++)
+            begin : grant_bit_gen
+                assign grant_idx[grant_idx_bit] = 0;
+            end
 
             assign grant_request = ior_request[grant_idx[CORE_ID_WIDTH - 1:0]];
         end
@@ -387,14 +386,15 @@ module io_interconnect
             assign grant_request = ior_request[0];
         end
     endgenerate
-    
+
+       
     //GENERATE RESPONSE
     assign ii_response.core = out_data[$bits(out_data)-1 : $bits(out_data)-(MIN_WIDTH+1)];
     assign ii_response.thread_idx = out_data[$bits(out_data)-(MIN_WIDTH+1)-1 : $bits(out_data)-(MIN_WIDTH+1)-$bits(ii_response.thread_idx)];
     assign ii_response.read_value = out_data[$bits(ii_response.read_value)-1 : 0];
     
-//    assign io_bus.write_en = |grant_oh && grant_request.is_store;
-//    assign io_bus.read_en = |grant_oh && !grant_request.is_store;
+//    assign io_bus.write_en = |grant_oh && grant_request.store;
+//    assign io_bus.read_en = |grant_oh && !grant_request.store;
 //    assign io_bus.write_data = grant_request.value;
 //    assign io_bus.address = grant_request.address;
     

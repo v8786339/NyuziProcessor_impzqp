@@ -14,7 +14,7 @@
 // limitations under the License.
 //
 
-`include "defines.sv"
+`include "defines.svh"
 
 import defines::*;
 
@@ -26,7 +26,7 @@ import defines::*;
 module nyuzi
     #(parameter RESET_PC = 0,
     parameter NUM_INTERRUPTS = 16,
-    //M_IO_AXI Parameters
+     //M_IO_AXI Parameters
     parameter  C_M_IO_TARGET_SLAVE_BASE_ADDR    = 32'h00000000,
     parameter integer C_M_IO_AXI_ADDR_WIDTH    = 32,
     parameter integer C_M_IO_AXI_DATA_WIDTH    = 32)
@@ -34,10 +34,10 @@ module nyuzi
     (input                          clk,
     input                           reset,
     axi4_interface.master           axi_bus,
-//    io_bus_interface.master         io_bus,
-    output logic                    processor_halt,
+    //io_bus_interface.master         io_bus,
+    jtag_interface.target           jtag,
     input [NUM_INTERRUPTS - 1:0]    interrupt_req,
-    //M_IO_AXI
+     //M_IO_AXI
     output wire [C_M_IO_AXI_ADDR_WIDTH-1 : 0] m_io_axi_awaddr,
     output wire [2 : 0] m_io_axi_awprot,
     output wire  m_io_axi_awvalid,
@@ -61,15 +61,16 @@ module nyuzi
     l2req_packet_t l2i_request[`NUM_CORES];
     logic[`NUM_CORES - 1:0] l2i_request_valid;
     ioreq_packet_t ior_request[`NUM_CORES];
-    logic[TOTAL_PERF_EVENTS - 1:0] perf_events;
-    io_bus_interface perf_io_bus();
-//    io_bus_interface interconnect_io_bus();
-    enum logic {
-        IO_PERF_COUNTERS,
-        IO_ARBITER
-    } io_read_source;
     logic[`NUM_CORES - 1:0] ior_request_valid;
     logic[TOTAL_THREADS - 1:0] thread_en;
+    scalar_t cr_data_to_host[`NUM_CORES];
+    scalar_t data_to_host;
+    logic[`NUM_CORES - 1:0] core_injected_complete;
+    logic[`NUM_CORES - 1:0] core_injected_rollback;
+    logic[`NUM_CORES - 1:0][TOTAL_THREADS - 1:0] core_suspend_thread;
+    logic[`NUM_CORES - 1:0][TOTAL_THREADS - 1:0] core_resume_thread;
+    logic[TOTAL_THREADS - 1:0] thread_suspend_mask;
+    logic[TOTAL_THREADS - 1:0] thread_resume_mask;
 
     /*AUTOLOGIC*/
     // Beginning of automatic wires (for undeclared instantiated-module outputs)
@@ -79,13 +80,24 @@ module nyuzi
     logic               l2_ready [`NUM_CORES];  // From l2_cache of l2_cache.v
     l2rsp_packet_t      l2_response;            // From l2_cache of l2_cache.v
     logic               l2_response_valid;      // From l2_cache of l2_cache.v
+    core_id_t           ocd_core;               // From on_chip_debugger of on_chip_debugger.v
+    scalar_t            ocd_data_from_host;     // From on_chip_debugger of on_chip_debugger.v
+    logic               ocd_data_update;        // From on_chip_debugger of on_chip_debugger.v
+    logic               ocd_halt;               // From on_chip_debugger of on_chip_debugger.v
+    logic               ocd_inject_en;          // From on_chip_debugger of on_chip_debugger.v
+    scalar_t            ocd_inject_inst;        // From on_chip_debugger of on_chip_debugger.v
+    local_thread_idx_t  ocd_thread;             // From on_chip_debugger of on_chip_debugger.v
     // End of automatics
-    
+
     initial
     begin
+        // Check config (see config.svh for rules)
         assert(`NUM_CORES >= 1 && `NUM_CORES <= (1 << CORE_ID_WIDTH));
+        assert(`L1D_WAYS >= `THREADS_PER_CORE);
+        assert(`L1I_WAYS >= `THREADS_PER_CORE);
     end
-    
+
+
     //***THREAD ENABLE***
     //INTERMEDIATE SIGNALS
     logic m_io_axi_awready_io_interconnect;
@@ -104,7 +116,6 @@ module nyuzi
         if(reset)
         begin
             axi_thread_ctrl_state <= IDLE;
-            thread_en <= 1;
         end
         else
         begin
@@ -114,16 +125,6 @@ module nyuzi
                     //If write in 0x5XXX Address Range
                     if(m_io_axi_awvalid_io_interconnect & m_io_axi_wvalid_io_interconnect & m_io_axi_awaddr[14] & m_io_axi_awaddr[12])
                     begin
-                        //THREAD RESUME
-                        if(m_io_axi_awaddr[3:0] == 0)
-                        begin
-                            thread_en <= thread_en | m_io_axi_wdata[$bits(thread_en)-1:0];
-                        end
-                        //THREAD HALT
-                        else if(m_io_axi_awaddr[3:0] == 4)
-                        begin
-                            thread_en <= thread_en & ~m_io_axi_wdata[$bits(thread_en)-1:0];
-                        end
                         axi_thread_ctrl_state <= CONFIRM;
                     end
                 end
@@ -196,59 +197,32 @@ module nyuzi
     
     assign m_io_axi_awvalid = m_io_axi_awvalid_out;
     assign m_io_axi_wvalid  = m_io_axi_wvalid_out;
-//    always_ff @(posedge clk, posedge reset)
-//    begin
-//        if (reset)
-//            thread_en <= 1;
-//        else
-//        begin
-//            if (io_bus.write_en)
-//            begin
-//                case (io_bus.address)
-//                    // Thread enable flag handling. This is limited to 32 threads.
-//                    'h100: // resume thread
-//                        thread_en <= thread_en | io_bus.write_data[TOTAL_THREADS - 1:0];
-//
-//                    'h104: // halt thread
-//                        thread_en <= thread_en & ~io_bus.write_data[TOTAL_THREADS - 1:0];
-//                endcase
-//            end
-//        end
-//    end
 
-    assign processor_halt = thread_en == 0;
+    // Thread enable
+    always @*
+    begin
+        thread_suspend_mask = '0;
+        thread_resume_mask = '0;
+        for (int i = 0; i < `NUM_CORES; i++)
+        begin
+            thread_suspend_mask |= core_suspend_thread[i];
+            thread_resume_mask |= core_resume_thread[i];
+        end
+    end
+
+    always_ff @(posedge clk, posedge reset)
+    begin
+        if (reset)
+            thread_en <= 1;
+        else
+            thread_en <= (thread_en | thread_resume_mask) & ~thread_suspend_mask;
+    end
 
     l2_cache l2_cache(
-        .l2_perf_events(perf_events[L2_PERF_EVENTS - 1:0]),
+        .l2_perf_events(),
         .*);
 
-//    always_ff @(posedge clk)
-//    begin
-//        if (interconnect_io_bus.address ==? 'h20? || interconnect_io_bus.address ==? 'h21?)
-//            io_read_source <= IO_PERF_COUNTERS;
-//        else
-//            io_read_source <= IO_ARBITER;
-//    end
-
-//    assign io_bus.write_en = interconnect_io_bus.write_en;
-//    assign io_bus.read_en = interconnect_io_bus.read_en;
-//    assign io_bus.address = interconnect_io_bus.address;
-//    assign io_bus.write_data = interconnect_io_bus.write_data;
-//
-//    assign perf_io_bus.write_en = interconnect_io_bus.write_en;
-//    assign perf_io_bus.read_en = interconnect_io_bus.read_en;
-//    assign perf_io_bus.address = interconnect_io_bus.address;
-//    assign perf_io_bus.write_data = interconnect_io_bus.write_data;
-//
-//    always_comb
-//    begin
-//        if (io_read_source == IO_PERF_COUNTERS)
-//            interconnect_io_bus.read_data = perf_io_bus.read_data;
-//        else
-//            interconnect_io_bus.read_data = io_bus.read_data; // External read
-//    end
-
-    io_interconnect 
+     io_interconnect 
         # (
             .C_M_IO_TARGET_SLAVE_BASE_ADDR(C_M_IO_TARGET_SLAVE_BASE_ADDR),
             .C_M_IO_AXI_ADDR_WIDTH(C_M_IO_AXI_ADDR_WIDTH),
@@ -264,12 +238,18 @@ module nyuzi
         .m_io_axi_wvalid(m_io_axi_wvalid_io_interconnect),
         .*);
 
-//    performance_counters #(
-//        .NUM_EVENTS(TOTAL_PERF_EVENTS),
-//        .BASE_ADDRESS('h200)
-//    ) performance_counters(
-//        .io_bus(perf_io_bus),
-//        .*);
+    on_chip_debugger on_chip_debugger(
+        .jtag(jtag),
+        .injected_complete(|core_injected_complete),
+        .injected_rollback(|core_injected_rollback),
+        .*);
+
+    generate
+        if (`NUM_CORES > 1)
+            assign data_to_host = cr_data_to_host[CORE_ID_WIDTH'(ocd_core)];
+        else
+            assign data_to_host = cr_data_to_host[0];
+    endgenerate
 
     genvar core_idx;
     generate
@@ -288,7 +268,11 @@ module nyuzi
                 .ior_request(ior_request[core_idx]),
                 .ii_ready(ii_ready[core_idx]),
                 .ii_response(ii_response),
-                .core_perf_events(perf_events[L2_PERF_EVENTS + CORE_PERF_EVENTS * core_idx+:CORE_PERF_EVENTS]),
+                .cr_data_to_host(cr_data_to_host[core_idx]),
+                .injected_complete(core_injected_complete[core_idx]),
+                .injected_rollback(core_injected_rollback[core_idx]),
+                .cr_suspend_thread(core_suspend_thread[core_idx]),
+                .cr_resume_thread(core_resume_thread[core_idx]),
                 .*);
         end
     endgenerate

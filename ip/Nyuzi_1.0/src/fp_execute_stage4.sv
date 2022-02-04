@@ -14,7 +14,7 @@
 // limitations under the License.
 //
 
-`include "defines.sv"
+`include "defines.svh"
 
 import defines::*;
 
@@ -33,50 +33,54 @@ module fp_execute_stage4(
     input                                       reset,
 
     // From fp_execute_stage3
-    input vector_lane_mask_t                    fx3_mask_value,
+    input vector_mask_t                         fx3_mask_value,
     input                                       fx3_instruction_valid,
     input decoded_instruction_t                 fx3_instruction,
     input local_thread_idx_t                    fx3_thread_idx,
     input subcycle_t                            fx3_subcycle,
-    input [NUM_VECTOR_LANES - 1:0]             fx3_result_is_inf,
-    input [NUM_VECTOR_LANES - 1:0]             fx3_result_is_nan,
-    input [NUM_VECTOR_LANES - 1:0][5:0]        fx3_ftoi_lshift,
+    input [NUM_VECTOR_LANES - 1:0]              fx3_result_inf,
+    input [NUM_VECTOR_LANES - 1:0]              fx3_result_nan,
+    input [NUM_VECTOR_LANES - 1:0]              fx3_equal,
+    input [NUM_VECTOR_LANES - 1:0][5:0]         fx3_ftoi_lshift,
 
     // Floating point addition/subtraction
-    input scalar_t[NUM_VECTOR_LANES - 1:0]     fx3_add_significand,
-    input[NUM_VECTOR_LANES - 1:0][7:0]         fx3_add_exponent,
-    input[NUM_VECTOR_LANES - 1:0]              fx3_add_result_sign,
-    input[NUM_VECTOR_LANES - 1:0]              fx3_logical_subtract,
+    input scalar_t[NUM_VECTOR_LANES - 1:0]      fx3_add_significand,
+    input[NUM_VECTOR_LANES - 1:0][7:0]          fx3_add_exponent,
+    input[NUM_VECTOR_LANES - 1:0]               fx3_add_result_sign,
+    input[NUM_VECTOR_LANES - 1:0]               fx3_logical_subtract,
 
     // Floating point multiplication
-    input [NUM_VECTOR_LANES - 1:0][63:0]       fx3_significand_product,
-    input [NUM_VECTOR_LANES - 1:0][7:0]        fx3_mul_exponent,
-    input [NUM_VECTOR_LANES - 1:0]             fx3_mul_sign,
+    input [NUM_VECTOR_LANES - 1:0][63:0]        fx3_significand_product,
+    input [NUM_VECTOR_LANES - 1:0][7:0]         fx3_mul_exponent,
+    input [NUM_VECTOR_LANES - 1:0]              fx3_mul_underflow,
+    input [NUM_VECTOR_LANES - 1:0]              fx3_mul_sign,
 
     // To fp_execute_stage5
     output logic                                fx4_instruction_valid,
     output decoded_instruction_t                fx4_instruction,
-    output vector_lane_mask_t                   fx4_mask_value,
+    output vector_mask_t                        fx4_mask_value,
     output local_thread_idx_t                   fx4_thread_idx,
     output subcycle_t                           fx4_subcycle,
-    output logic [NUM_VECTOR_LANES - 1:0]      fx4_result_is_inf,
-    output logic [NUM_VECTOR_LANES - 1:0]      fx4_result_is_nan,
+    output logic [NUM_VECTOR_LANES - 1:0]       fx4_result_inf,
+    output logic [NUM_VECTOR_LANES - 1:0]       fx4_result_nan,
+    output logic [NUM_VECTOR_LANES - 1:0]       fx4_equal,
 
     // Floating point addition/subtraction
-    output logic[NUM_VECTOR_LANES - 1:0][7:0]  fx4_add_exponent,
-    output logic[NUM_VECTOR_LANES - 1:0][31:0] fx4_add_significand,
-    output logic[NUM_VECTOR_LANES - 1:0]       fx4_add_result_sign,
-    output logic[NUM_VECTOR_LANES - 1:0]       fx4_logical_subtract,
-    output logic[NUM_VECTOR_LANES - 1:0][5:0]  fx4_norm_shift,
+    output logic[NUM_VECTOR_LANES - 1:0][7:0]   fx4_add_exponent,
+    output logic[NUM_VECTOR_LANES - 1:0][31:0]  fx4_add_significand,
+    output logic[NUM_VECTOR_LANES - 1:0]        fx4_add_result_sign,
+    output logic[NUM_VECTOR_LANES - 1:0]        fx4_logical_subtract,
+    output logic[NUM_VECTOR_LANES - 1:0][5:0]   fx4_norm_shift,
 
     // Floating point multiplication
-    output logic[NUM_VECTOR_LANES - 1:0][63:0] fx4_significand_product,
-    output logic[NUM_VECTOR_LANES - 1:0][7:0]  fx4_mul_exponent,
-    output logic[NUM_VECTOR_LANES - 1:0]       fx4_mul_sign);
+    output logic[NUM_VECTOR_LANES - 1:0][63:0]  fx4_significand_product,
+    output logic[NUM_VECTOR_LANES - 1:0][7:0]   fx4_mul_exponent,
+    output logic[NUM_VECTOR_LANES - 1:0]        fx4_mul_underflow,
+    output logic[NUM_VECTOR_LANES - 1:0]        fx4_mul_sign);
 
-    logic is_ftoi;
+    logic ftoi;
 
-    assign is_ftoi = fx3_instruction.alu_op == OP_FTOI;
+    assign ftoi = fx3_instruction.alu_op == OP_FTOI;
 
     genvar lane_idx;
     generate
@@ -91,7 +95,7 @@ module fp_execute_stage4(
                 // normalization shift measures how far the value needs to be shifted to
                 // make the leading one be truncated.
                 leading_zeroes = 0;
-                casez (fx3_add_significand[lane_idx])
+                unique casez (fx3_add_significand[lane_idx])
                     32'b1???????????????????????????????: leading_zeroes = 0;
                     32'b01??????????????????????????????: leading_zeroes = 1;
                     32'b001?????????????????????????????: leading_zeroes = 2;
@@ -132,15 +136,17 @@ module fp_execute_stage4(
             always_ff @(posedge clk)
             begin
                 fx4_add_significand[lane_idx] <= fx3_add_significand[lane_idx];
-                fx4_norm_shift[lane_idx] <= is_ftoi ? fx3_ftoi_lshift[lane_idx] : leading_zeroes;
+                fx4_norm_shift[lane_idx] <= ftoi ? fx3_ftoi_lshift[lane_idx] : leading_zeroes;
                 fx4_add_exponent[lane_idx] <= fx3_add_exponent[lane_idx];
                 fx4_add_result_sign[lane_idx] <= fx3_add_result_sign[lane_idx];
                 fx4_logical_subtract[lane_idx] <= fx3_logical_subtract[lane_idx];
                 fx4_significand_product[lane_idx] <= fx3_significand_product[lane_idx];
                 fx4_mul_exponent[lane_idx] <= fx3_mul_exponent[lane_idx];
+                fx4_mul_underflow[lane_idx] <= fx3_mul_underflow[lane_idx];
                 fx4_mul_sign[lane_idx] <= fx3_mul_sign[lane_idx];
-                fx4_result_is_inf[lane_idx] <= fx3_result_is_inf[lane_idx];
-                fx4_result_is_nan[lane_idx] <= fx3_result_is_nan[lane_idx];
+                fx4_result_inf[lane_idx] <= fx3_result_inf[lane_idx];
+                fx4_result_nan[lane_idx] <= fx3_result_nan[lane_idx];
+                fx4_equal[lane_idx] <= fx3_equal[lane_idx];
             end
         end
     endgenerate

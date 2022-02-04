@@ -14,7 +14,7 @@
 // limitations under the License.
 //
 
-`include "defines.sv"
+`include "defines.svh"
 
 import defines::*;
 
@@ -65,7 +65,7 @@ module l1_l2_interface
     output logic                                  l2i_itag_update_valid,
 
     // To instruction_decode_stage
-    output local_thread_bitmap_t                  sq_sync_store_pending,
+    output local_thread_bitmap_t                  sq_store_sync_pending,
 
     // From ifetch_tag_stage
     input l1i_way_idx_t                           ift_fill_lru,
@@ -128,14 +128,17 @@ module l1_l2_interface
     output logic[CACHE_LINE_BYTES - 1:0]          sq_store_bypass_mask,
     output logic                                  sq_store_sync_success,
     output cache_line_data_t                      sq_store_bypass_data,
-    output logic                                  sq_rollback_en);
+    output logic                                  sq_rollback_en,
+
+    // To core
+    output logic                                  l2i_perf_store);
 
     logic[`L1D_WAYS - 1:0] snoop_hit_way_oh;    // Only snoops dcache
     l1d_way_idx_t snoop_hit_way_idx;
     logic[`L1I_WAYS - 1:0] ifill_way_oh;
     logic[`L1D_WAYS - 1:0] dupdate_way_oh;
     l1d_way_idx_t dupdate_way_idx;
-    logic is_ack_for_me;
+    logic ack_for_me;
     logic icache_update_en;
     logic dcache_update_en;
     logic dcache_l2_response_valid;
@@ -145,7 +148,7 @@ module l1_l2_interface
     logic storebuf_l2_response_valid;
     l1_miss_entry_idx_t storebuf_l2_response_idx;
     local_thread_bitmap_t dcache_miss_wake_bitmap;
-    logic sq_dequeue_ack;
+    logic storebuf_dequeue_ack;
     logic icache_dequeue_ready;
     logic icache_dequeue_ack;
     logic dcache_dequeue_ready;
@@ -160,12 +163,12 @@ module l1_l2_interface
     l1d_set_idx_t dcache_set_stage1;
     l1i_set_idx_t icache_set_stage1;
     l1d_set_idx_t dcache_set_stage2;
-    l1d_set_idx_t icache_set_stage2;
+    l1i_set_idx_t icache_set_stage2;
     l1d_tag_t dcache_tag_stage2;
     l1i_tag_t icache_tag_stage2;
     logic storebuf_l2_sync_success;
-    logic response_is_iinvalidate;
-    logic response_is_dinvalidate;
+    logic response_iinvalidate;
+    logic response_dinvalidate;
 
     /*AUTOLOGIC*/
     // Beginning of automatic wires (for undeclared instantiated-module outputs)
@@ -295,43 +298,43 @@ module l1_l2_interface
         .index(dupdate_way_idx),
         .one_hot(dupdate_way_oh));
 
-    idx_to_oh #(.NUM_SIGNALS(`L1D_WAYS)) idx_to_oh_ifill_way(
+    idx_to_oh #(.NUM_SIGNALS(`L1I_WAYS)) idx_to_oh_ifill_way(
         .index(ift_fill_lru),
         .one_hot(ifill_way_oh));
 
-    assign is_ack_for_me = response_stage2_valid && response_stage2.core == CORE_ID;
+    assign ack_for_me = response_stage2_valid && response_stage2.core == CORE_ID;
 
     //
     // Update data cache tag
     //
-    assign response_is_dinvalidate = response_stage2.packet_type == L2RSP_DINVALIDATE_ACK;
-    assign dcache_update_en = (is_ack_for_me && ((response_stage2.packet_type == L2RSP_LOAD_ACK
+    assign response_dinvalidate = response_stage2.packet_type == L2RSP_DINVALIDATE_ACK;
+    assign dcache_update_en = (ack_for_me && ((response_stage2.packet_type == L2RSP_LOAD_ACK
         && response_stage2.cache_type == CT_DCACHE) || response_stage2.packet_type == L2RSP_STORE_ACK))
-        || (response_stage2_valid && response_is_dinvalidate && |snoop_hit_way_oh);
+        || (response_stage2_valid && response_dinvalidate && |snoop_hit_way_oh);
     assign l2i_dtag_update_en_oh = dupdate_way_oh & {`L1D_WAYS{dcache_update_en}};
     assign l2i_dtag_update_tag = dcache_tag_stage2;
     assign l2i_dtag_update_set = dcache_set_stage2;
-    assign l2i_dtag_update_valid = !response_is_dinvalidate;
+    assign l2i_dtag_update_valid = !response_dinvalidate;
 
     //
     // Update instruction cache tag. For a fill, mark the line valid and update the tag.
     // For a invalidate, mark all ways for the selected set invalid
     //
-    assign response_is_iinvalidate = response_stage2_valid
+    assign response_iinvalidate = response_stage2_valid
         && response_stage2.packet_type == L2RSP_IINVALIDATE_ACK;
-    assign icache_update_en = (is_ack_for_me && response_stage2.cache_type == CT_ICACHE)
-        || response_is_iinvalidate;
-    assign l2i_itag_update_en = response_is_iinvalidate ? {`L1I_WAYS{1'b1}}
+    assign icache_update_en = (ack_for_me && response_stage2.cache_type == CT_ICACHE)
+        || response_iinvalidate;
+    assign l2i_itag_update_en = response_iinvalidate ? {`L1I_WAYS{1'b1}}
         : (ifill_way_oh & {`L1I_WAYS{icache_update_en}});
     assign l2i_itag_update_tag = icache_tag_stage2;
     assign l2i_itag_update_set = icache_set_stage2;
-    assign l2i_itag_update_valid = !response_is_iinvalidate;
+    assign l2i_itag_update_valid = !response_iinvalidate;
 
     // Wake up entries that have had their miss satisfied.
-    assign icache_l2_response_valid = is_ack_for_me && response_stage2.cache_type == CT_ICACHE;
-    assign dcache_l2_response_valid = is_ack_for_me && response_stage2.packet_type == L2RSP_LOAD_ACK
+    assign icache_l2_response_valid = ack_for_me && response_stage2.cache_type == CT_ICACHE;
+    assign dcache_l2_response_valid = ack_for_me && response_stage2.packet_type == L2RSP_LOAD_ACK
         && response_stage2.cache_type == CT_DCACHE;
-    assign storebuf_l2_response_valid = is_ack_for_me
+    assign storebuf_l2_response_valid = ack_for_me
         && (response_stage2.packet_type == L2RSP_STORE_ACK
         || response_stage2.packet_type == L2RSP_FLUSH_ACK
         || response_stage2.packet_type == L2RSP_IINVALIDATE_ACK
@@ -375,6 +378,9 @@ module l1_l2_interface
             assert(!sq_dequeue_ready || $onehot0({sq_dequeue_flush, sq_dequeue_iinvalidate,
                 sq_dequeue_dinvalidate}));
 
+            // Can only send one request per cycle
+            assert($onehot0({dcache_dequeue_ack, icache_dequeue_ack, storebuf_dequeue_ack}));
+
             // These are latched to delay then one cycle from the tag updates
             // Update cache line for data cache
             l2i_ddata_update_en <= dcache_update_en || (|snoop_hit_way_oh && response_stage2_valid
@@ -393,9 +399,10 @@ module l1_l2_interface
     begin
         l2i_request_valid = 0;
         l2i_request = 0;
-        sq_dequeue_ack = 0;
+        storebuf_dequeue_ack = 0;
         icache_dequeue_ack = 0;
         dcache_dequeue_ack = 0;
+        l2i_perf_store = 0;
 
         l2i_request.core = CORE_ID;
 
@@ -408,6 +415,8 @@ module l1_l2_interface
             l2i_request.id = dcache_dequeue_idx;
             l2i_request.address = dcache_dequeue_addr;
             l2i_request.cache_type = CT_DCACHE;
+            if (l2_ready)
+                dcache_dequeue_ack = 1;
         end
         else if (icache_dequeue_ready)
         begin
@@ -417,6 +426,8 @@ module l1_l2_interface
             l2i_request.id = icache_dequeue_idx;
             l2i_request.address = icache_dequeue_addr;
             l2i_request.cache_type = CT_ICACHE;
+            if (l2_ready)
+                icache_dequeue_ack = 1;
         end
         else if (sq_dequeue_ready)
         begin
@@ -438,17 +449,11 @@ module l1_l2_interface
             l2i_request.data = sq_dequeue_data;
             l2i_request.store_mask = sq_dequeue_mask;
             l2i_request.cache_type = CT_DCACHE;
-        end
-
-        if (l2_ready)
-        begin
-            // Request acknowledged, mark it as sent
-            if (dcache_dequeue_ready)
-                dcache_dequeue_ack = 1;
-            else if (icache_dequeue_ready)
-                icache_dequeue_ack = 1;
-            else if (sq_dequeue_ready)
-                sq_dequeue_ack = 1;
+            if (l2_ready)
+            begin
+                storebuf_dequeue_ack = 1;
+                l2i_perf_store = l2i_request.packet_type == L2REQ_STORE;
+            end
         end
     end
 endmodule

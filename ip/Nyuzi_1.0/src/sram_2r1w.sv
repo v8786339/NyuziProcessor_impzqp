@@ -119,7 +119,8 @@ module sram_2r1w
         end
     endgenerate
 `elsif VENDOR_XILINX
-    // For [Synth 8-439] module 'xpm_memory_sdpram' not found:
+    // If you get an error [Synth 8-439] module 'xpm_memory_sdpram' not found,
+    // you must set the property XPM_LIBRARIES on the project.
     // https://www.xilinx.com/support/answers/67815.html
 
     localparam XPM_MEM_SIZE = (1 << ADDR_WIDTH) * DATA_WIDTH; // Memory size in bits
@@ -249,9 +250,7 @@ module sram_2r1w
     logic[DATA_WIDTH - 1:0] data[SIZE];
 
     // Note: use always here instead of always_ff so Modelsim will allow
-    // initializing the array to zeroes in the initial block. That in
-    // turn is necessary to avoid X-propagation issues with running with
-    // four-state simulators.
+    // initializing the array in the initial block (see below).
     always @(posedge clk)
     begin
         if (write_en)
@@ -262,30 +261,36 @@ module sram_2r1w
             if (READ_DURING_WRITE == "NEW_DATA")
                 read1_data <= write_data;    // Bypass
             else
-                read1_data <= {DATA_WIDTH{1'bx}};    // This will be randomized by Verilator
+                read1_data <= DATA_WIDTH'($random()); // ensure it is really "don't care"
         end
         else if (read1_en)
             read1_data <= data[read1_addr];
         else
-            read1_data <= {DATA_WIDTH{1'bx}};
+            read1_data <= DATA_WIDTH'($random());
 
         if (write_addr == read2_addr && write_en && read2_en)
         begin
             if (READ_DURING_WRITE == "NEW_DATA")
                 read2_data <= write_data;    // Bypass
             else
-                read2_data <= {DATA_WIDTH{1'bx}};    // This will be randomized by Verilator
+                read2_data <= DATA_WIDTH'($random());
         end
         else if (read2_en)
             read2_data <= data[read2_addr];
         else
-            read2_data <= {DATA_WIDTH{1'bx}};
+            read2_data <= DATA_WIDTH'($random());
     end
 
     initial
     begin
+`ifndef VERILATOR
+        // Initialize RAM with random values. This is unneeded on Verilator
+        // (which already does randomizes memory), but is necessary on
+        // 4-state simulators because memory is initially filled with Xs.
+        // This was causing x-propagation bugs in some modules previously.
         for (int i = 0; i < SIZE; i++)
-            data[i] = '0;
+            data[i] = DATA_WIDTH'($random());
+`endif
 
         if ($test$plusargs("dumpmems") != 0)
             $display("sram2r1w %d %d", DATA_WIDTH, SIZE);

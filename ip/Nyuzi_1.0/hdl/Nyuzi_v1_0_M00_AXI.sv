@@ -1,7 +1,7 @@
 
 `timescale 1 ns / 1 ps
 
-`include "../src/defines.sv"
+`include "../src/defines.svh"
 
 import defines::*;
 

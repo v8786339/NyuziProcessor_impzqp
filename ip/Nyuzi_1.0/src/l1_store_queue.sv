@@ -14,7 +14,7 @@
 // limitations under the License.
 //
 
-`include "defines.sv"
+`include "defines.svh"
 
 import defines::*;
 
@@ -24,7 +24,7 @@ import defines::*;
 // here as well.
 // A memory barrier request waits until all pending store requests finish.
 // It acts like a store in terms of rollback logic, but doesn't enqueue
-// anything if the store buffer is empty.
+// anything.
 //
 
 module l1_store_queue(
@@ -32,7 +32,7 @@ module l1_store_queue(
     input                                  reset,
 
     // To instruction_decode_stage
-    output local_thread_bitmap_t           sq_sync_store_pending,
+    output local_thread_bitmap_t           sq_store_sync_pending,
 
     // From dache_data_stage
     input                                  dd_store_en,
@@ -54,7 +54,7 @@ module l1_store_queue(
     output logic                           sq_store_sync_success,
 
     // From l1_l2_interface
-    input                                  sq_dequeue_ack,
+    input                                  storebuf_dequeue_ack,
     input                                  storebuf_l2_response_valid,
     input l1_miss_entry_idx_t              storebuf_l2_response_idx,
     input                                  storebuf_l2_sync_success,
@@ -109,7 +109,7 @@ module l1_store_queue(
             logic can_write_combine;
             logic store_requested_this_entry;
             logic send_this_cycle;
-            logic is_restarted_sync_request;
+            logic restarted_sync_request;
             logic got_response_this_entry;
             logic membar_requested_this_entry;
             logic enqueue_cache_control;
@@ -118,10 +118,9 @@ module l1_store_queue(
                 && !pending_stores[thread_idx].request_sent;
             assign store_requested_this_entry = dd_store_en && dd_store_thread_idx == local_thread_idx_t'(thread_idx);
             assign membar_requested_this_entry = dd_membar_en && dd_store_thread_idx == local_thread_idx_t'(thread_idx);
-            assign send_this_cycle = send_grant_oh[thread_idx] && sq_dequeue_ack;
+            assign send_this_cycle = send_grant_oh[thread_idx] && storebuf_dequeue_ack;
             assign can_write_combine = pending_stores[thread_idx].valid
                 && pending_stores[thread_idx].address == dd_store_addr
-                && !pending_stores[thread_idx].sync
                 && !pending_stores[thread_idx].flush
                 && !pending_stores[thread_idx].iinvalidate
                 && !pending_stores[thread_idx].dinvalidate
@@ -131,12 +130,12 @@ module l1_store_queue(
                 && !dd_flush_en
                 && !dd_iinvalidate_en
                 && !dd_dinvalidate_en;
-            assign is_restarted_sync_request = pending_stores[thread_idx].valid
+            assign restarted_sync_request = pending_stores[thread_idx].valid
                 && pending_stores[thread_idx].response_received
                 && pending_stores[thread_idx].sync;
             assign update_store_entry = store_requested_this_entry
                 && (!pending_stores[thread_idx].valid || can_write_combine || got_response_this_entry)
-                && !is_restarted_sync_request;
+                && !restarted_sync_request;
             assign got_response_this_entry = storebuf_l2_response_valid
                 && storebuf_l2_response_idx == local_thread_idx_t'(thread_idx);
             assign sq_wake_bitmap[thread_idx] = got_response_this_entry
@@ -144,7 +143,7 @@ module l1_store_queue(
             assign enqueue_cache_control = dd_store_thread_idx == local_thread_idx_t'(thread_idx)
                 && (!pending_stores[thread_idx].valid || got_response_this_entry)
                 && (dd_flush_en || dd_dinvalidate_en || dd_iinvalidate_en);
-            assign sq_sync_store_pending[thread_idx] = pending_stores[thread_idx].valid
+            assign sq_store_sync_pending[thread_idx] = pending_stores[thread_idx].valid
                 && pending_stores[thread_idx].sync;
 
             always_comb
@@ -161,7 +160,7 @@ module l1_store_queue(
                     //   needing to handle the lost wakeup issue (like the near miss case
                     //   in the data cache)
                     if (dd_store_sync)
-                        rollback[thread_idx] = !is_restarted_sync_request;
+                        rollback[thread_idx] = !restarted_sync_request;
                     else if (pending_stores[thread_idx].valid && !can_write_combine
                         && !got_response_this_entry)
                         rollback[thread_idx] = 1;
@@ -177,6 +176,32 @@ module l1_store_queue(
                     pending_stores[thread_idx] <= 0;
                 else
                 begin
+                    if ((dd_store_en || dd_flush_en || dd_membar_en
+                        || dd_iinvalidate_en || dd_dinvalidate_en)
+                        && dd_store_thread_idx == thread_idx)
+                    begin
+                        // Can't issue a new request if the thread is waiting.
+                        assert(!pending_stores[thread_idx].thread_waiting);
+                    end
+
+                    if (dd_store_en && dd_store_thread_idx == thread_idx
+                        && pending_stores[thread_idx].sync
+                        && pending_stores[thread_idx].valid)
+                    begin
+                        // A synchronized store is already pending for this thread.
+                        // This must be the second pass to pick up the result. Ensure
+                        // some constraints are true:
+
+                        // The thread should be unblocked until the L2 cache responds.
+                        assert(pending_stores[thread_idx].response_received);
+
+                        // The restarted store should be synchronized
+                        assert(dd_store_sync);
+
+                        // The request should be for the same address.
+                        assert(dd_store_addr == pending_stores[thread_idx].address);
+                    end
+
                     if (send_this_cycle)
                         pending_stores[thread_idx].request_sent <= 1;
 
@@ -205,7 +230,7 @@ module l1_store_queue(
                     begin
                         // Attempt to enqueue a new request. This may happen the same cycle
                         // an old request is satisfied. In this case, replace the old entry.
-                        if (is_restarted_sync_request)
+                        if (restarted_sync_request)
                         begin
                             // This is the restarted request after a synchronized load/store.
                             // Clear the entry.

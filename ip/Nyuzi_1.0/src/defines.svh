@@ -14,10 +14,10 @@
 // limitations under the License.
 //
 
-`ifndef __DEFINES_SV
-`define __DEFINES_SV
+`ifndef __DEFINES_SVH
+`define __DEFINES_SVH
 
-`include "config.sv"
+`include "config.svh"
 
 package defines;
 
@@ -49,7 +49,8 @@ typedef logic[$clog2(`THREADS_PER_CORE) - 1:0] local_thread_idx_t;
 typedef logic[`THREADS_PER_CORE - 1:0] local_thread_bitmap_t; // One bit per thread
 typedef logic[4:0] register_idx_t;
 typedef logic[$clog2(NUM_VECTOR_LANES) - 1:0] subcycle_t;
-typedef logic[NUM_VECTOR_LANES - 1:0] vector_lane_mask_t;
+typedef logic[NUM_VECTOR_LANES - 1:0] vector_mask_t;
+typedef logic[14:0] syscall_index_t;
 
 parameter CORE_ID_WIDTH = $clog2(`NUM_CORES);
 
@@ -63,22 +64,25 @@ parameter CORE_ID_WIDTH = $clog2(`NUM_CORES);
 // now that it is a parameter, but I haven't tested.
 typedef logic[3:0] core_id_t;
 
-parameter CORE_PERF_EVENTS = 13;
+// CORE_PERF_EVENTS should match the number of signals in the assignment to
+// core_perf_events in core.sv and L2_PERF_EVENTS must match the number of
+// signals in the assignment to l2_perf_events in l2_cache.sv.
+parameter CORE_PERF_EVENTS = 14;
 parameter L2_PERF_EVENTS = 3;
-parameter TOTAL_PERF_EVENTS = L2_PERF_EVENTS + CORE_PERF_EVENTS * `NUM_CORES;
 
 //
 // Instruction encodings
 //
 
 parameter INSTRUCTION_NOP = 32'd0;
-parameter REG_RA = (register_idx_t'(31));
+parameter REG_RA = register_idx_t'(31);
 
 // Immediate/register arithmetic operation encodings
 typedef enum logic[5:0] {
     OP_OR                   = 6'b000000,    // Bitwise logical or
-    OP_AND                  = 6'b000001,
-    OP_XOR                  = 6'b000011,
+    OP_AND                  = 6'b000001,    // bitwise logical and
+    OP_SYSCALL              = 6'b000010,    // raise syscall trap
+    OP_XOR                  = 6'b000011,    // bitwise logical exclusive or
     OP_ADD_I                = 6'b000101,    // Add integer
     OP_SUB_I                = 6'b000110,    // Subtract integer
     OP_MULL_I               = 6'b000111,    // Multiply integer low
@@ -116,8 +120,7 @@ typedef enum logic[5:0] {
     OP_CMPLE_F              = 6'b101111,    // Floating point less than or equal
     OP_CMPEQ_F              = 6'b110000,    // Floating point equal
     OP_CMPNE_F              = 6'b110001,    // Floating point not-equal
-    OP_BREAKPOINT           = 6'b111110,
-    OP_SYSCALL              = 6'b111111
+    OP_BREAKPOINT           = 6'b111110
 } alu_op_t;
 
 // Operation type field encodings for memory instructions
@@ -174,10 +177,20 @@ typedef enum logic [4:0] {
     CR_SCRATCHPAD0          = 5'd11,
     CR_SCRATCHPAD1          = 5'd12,
     CR_SUBCYCLE             = 5'd13,
-    CR_INTERRUPT_MASK       = 5'd14,
+    CR_INTERRUPT_ENABLE     = 5'd14,
     CR_INTERRUPT_ACK        = 5'd15,
     CR_INTERRUPT_PENDING    = 5'd16,
-    CR_INTERRUPT_TRIGGER    = 5'd17
+    CR_INTERRUPT_TRIGGER    = 5'd17,
+    CR_JTAG_DATA            = 5'd18,
+    CR_SYSCALL_INDEX        = 5'd19,
+    CR_SUSPEND_THREAD       = 5'd20,
+    CR_RESUME_THREAD        = 5'd21,
+    CR_PERF_EVENT_SELECT0   = 5'd22,
+    CR_PERF_EVENT_SELECT1   = 5'd23,
+    CR_PERF_EVENT_COUNT0_L  = 5'd24,
+    CR_PERF_EVENT_COUNT0_H  = 5'd25,
+    CR_PERF_EVENT_COUNT1_L  = 5'd26,
+    CR_PERF_EVENT_COUNT1_H  = 5'd27
 } control_register_t;
 
 // Trap type encodings
@@ -224,8 +237,8 @@ typedef enum logic [1:0] {
 } pipeline_sel_t;
 
 typedef struct packed {
-    logic is_dcache;
-    logic is_store;
+    logic dcache;
+    logic store;
     trap_type_t trap_type;
 } trap_cause_t;
 
@@ -233,6 +246,9 @@ typedef logic[3:0] interrupt_id_t;
 
 typedef struct packed {
     scalar_t pc;
+
+    // Was this instruction injected by the on-chip debugger
+    logic injected;
 
     // Piggybacked exceptions
     logic has_trap;
@@ -248,25 +264,25 @@ typedef struct packed {
     logic has_vector2;
     register_idx_t vector_sel2;
     logic has_dest;
-    logic dest_is_vector;
+    logic dest_vector;
     register_idx_t dest_reg;
     alu_op_t alu_op;
     mask_src_t mask_src;
     op1_src_t op1_src;
     op2_src_t op2_src;
-    logic store_value_is_vector;
+    logic store_value_vector;
     scalar_t immediate_value;
-    logic is_branch;
+    logic branch;
     branch_type_t branch_type;
-    logic is_call;
+    logic call;
     pipeline_sel_t pipeline_sel;
-    logic is_memory_access;
+    logic memory_access;
     memory_op_t memory_access_type;
-    logic is_load;
-    logic is_compare;
-    subcycle_t last_subcycle;
+    logic load;
+    logic compare;
+    subcycle_t last_subcycle; // count of last subcycle, not a boolean flag
     control_register_t creg_index;
-    logic is_cache_control;
+    logic cache_control;
     cache_op_t cache_control_op;
 } decoded_instruction_t;
 
@@ -325,7 +341,7 @@ typedef struct packed {
     l2_set_idx_t set_idx;
 } l2_addr_t;
 
-// Memory address that is multiple of cache line size
+// Memory address expressed as multiple of cache line size
 typedef logic[31 - CACHE_LINE_OFFSET_WIDTH:0] cache_line_index_t;
 
 typedef enum logic {
@@ -377,7 +393,7 @@ typedef struct packed {
 
 // I/O bus request
 typedef struct packed {
-    logic is_store;
+    logic store;
     local_thread_idx_t thread_idx;
     scalar_t address;
     scalar_t value;
@@ -390,12 +406,7 @@ typedef struct packed {
     scalar_t read_value;
 } iorsp_packet_t;
 
-// AMBA AXI and ACE Protocol Specification, rev E, Table A3-3
-typedef enum logic[1:0] {
-    AXI_BURST_FIXED = 2'b00,
-    AXI_BURST_INCR = 2'b01,
-    AXI_BURST_WRAP = 2'b10
-} axi_burst_type_t;
+parameter AXI_ADDR_WIDTH = 32;
 
 endpackage : defines
 
@@ -421,19 +432,21 @@ endinterface
         assign s.read_data = m.read_data;
 
 // AMBA AXI-4 bus interface
+// See table A10-1 and A10-3 for default values of optional signals not included here.
 interface axi4_interface;
+    // Global signals (Table A2-1)
+    logic m_aclk;
+    logic m_aresetn;
+
     // Write address channel (Table A2-2)
-    logic [31:0] m_awaddr;
+    logic [AXI_ADDR_WIDTH - 1:0] m_awaddr;
     logic [7:0] m_awlen;
-    logic [2:0] m_awsize;
-    defines::axi_burst_type_t m_awburst;
-    logic [3:0] m_awcache;
+    logic [2:0] m_awprot;
     logic m_awvalid;
     logic s_awready;
 
     // Write data channel (Table A2-3)
     logic [`AXI_DATA_WIDTH - 1:0] m_wdata;
-    logic [`AXI_DATA_WIDTH / 8 - 1:0] m_wstrb;
     logic m_wlast;
     logic m_wvalid;
     logic s_wready;
@@ -443,11 +456,9 @@ interface axi4_interface;
     logic m_bready;
 
     // Read address channel (Table A2-5)
-    logic [31:0] m_araddr;
+    logic [AXI_ADDR_WIDTH - 1:0] m_araddr;
     logic [7:0] m_arlen;
-    logic [2:0] m_arsize;
-    defines::axi_burst_type_t m_arburst;
-    logic [3:0] m_arcache;
+    logic [2:0] m_arprot;
     logic m_arvalid;
     logic s_arready;
 
@@ -457,12 +468,22 @@ interface axi4_interface;
     logic m_rready;
 
     modport master(input s_awready, s_wready, s_bvalid, s_arready, s_rvalid, s_rdata,
-        output m_awaddr, m_awlen, m_awvalid, m_wdata, m_wlast, m_wvalid, m_bready, m_araddr, m_arlen,
-        m_arvalid, m_rready, m_awsize, m_awburst, m_wstrb, m_arsize, m_arburst, m_awcache, m_arcache);
-    modport slave(input m_awaddr, m_awlen, m_awvalid, m_wdata, m_wlast, m_wvalid, m_bready, m_araddr,
-        m_arlen, m_arvalid, m_rready, m_awsize, m_awburst, m_wstrb, m_arsize, m_arburst,
-        m_awcache, m_arcache,
+        output m_awaddr, m_awlen, m_awvalid, m_wdata, m_wlast, m_wvalid, m_bready, m_araddr,
+        m_arlen, m_arvalid, m_rready, m_aclk, m_aresetn, m_arprot, m_awprot);
+    modport slave(input m_awaddr, m_awlen, m_awvalid, m_wdata, m_wlast, m_wvalid, m_bready,
+        m_araddr, m_arlen, m_arvalid, m_rready, m_aclk, m_aresetn, m_arprot, m_awprot,
         output s_awready, s_wready, s_bvalid, s_arready, s_rvalid, s_rdata);
+endinterface
+
+interface jtag_interface;
+    logic tck;
+    logic trst_n;
+    logic tdi;
+    logic tdo;
+    logic tms;
+
+    modport host(input tdi, output tck, trst_n, tdo, tms);
+    modport target(input tck, trst_n, tdi, tms, output tdo);
 endinterface
 
 `endif

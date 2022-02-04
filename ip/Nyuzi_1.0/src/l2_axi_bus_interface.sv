@@ -14,25 +14,29 @@
 // limitations under the License.
 //
 
-`include "defines.sv"
+`include "defines.svh"
 
 import defines::*;
 
 //
-// L2 AXI Bus Interface
+// L2 Bus Interface
 // Receives L2 cache misses and writeback requests from the L2 pipeline and
-// controls AXI system memory interface to fulfill them. When fills complete,
+// drives system memory interface to fulfill them. When fills complete,
 // this reissues them to the L2 pipeline via the arbiter.
 //
-// If this is already handling the request for a line, it set a flag that
-// causes it to reissue the request to the L2 pipeline, but doesn't read
-// or write system memory.
+// If a load miss is already pending for a line, this set a flag on the FIFO
+// entry that will skip the load. It will, however, still reissue it to the
+// L2 pipeline.
 //
 // The interface to system memory is the AMBA AXI interface.
 // http://www.arm.com/products/system-ip/amba-specifications.php
 //
-// XXX This does not overlap address and data phases, but it should to improve
-// bus utilization.
+// I've tried to keep all bus logic consolidated in this module to make it
+// easier to swap this out for other bus implementations (eg Wishbone).
+//
+// Todo: This should issue the address for the next bus transaction before it
+// has finished the previous data transfer to improve utilization, especially
+// in systems with larger memory latency.
 //
 
 module l2_axi_bus_interface(
@@ -52,8 +56,8 @@ module l2_axi_bus_interface(
     input                                  l2r_needs_writeback,
     input l2_tag_t                         l2r_writeback_tag,
     input cache_line_data_t                l2r_data,
-    input                                  l2r_is_l2_fill,
-    input                                  l2r_is_restarted_flush,
+    input                                  l2r_l2_fill,
+    input                                  l2r_restarted_flush,
     input                                  l2r_cache_hit,
     input                                  l2r_request_valid,
     input l2req_packet_t                   l2r_request,
@@ -73,12 +77,12 @@ module l2_axi_bus_interface(
     typedef struct packed {
         cache_line_index_t address;
         cache_line_data_t data;
-        logic is_flush;
+        logic flush;
         core_id_t core;
         l1_miss_entry_idx_t id;
-    } writeback_queue_entry_t;
+    } writeback_fifo_entry_t;
 
-    localparam REQUEST_QUEUE_LENGTH = 8;
+    localparam FIFO_SIZE = 8;
 
     // This is the number of stages before this one in the pipeline. Assert the
     // signal to stop accepting new packets this number of cycles early so
@@ -88,120 +92,110 @@ module l2_axi_bus_interface(
     localparam BURST_OFFSET_WIDTH = $clog2(BURST_BEATS);
 
     l2_addr_t miss_addr;
-    cache_line_index_t bif_writeback_address;
+    cache_line_index_t writeback_address;
     logic enqueue_writeback_request;
-    logic enqueue_load_request;
+    logic enqueue_fill_request;
     logic duplicate_request;
-    cache_line_data_t bif_writeback_data;
-    logic[`AXI_DATA_WIDTH - 1:0] bif_writeback_lanes[BURST_BEATS];
-    logic writeback_queue_empty;
-    logic load_queue_empty;
-    logic load_request_pending;
+    cache_line_data_t writeback_data;
+    logic[`AXI_DATA_WIDTH - 1:0] writeback_lanes[BURST_BEATS];
+    logic writeback_fifo_empty;
+    logic fill_queue_empty;
+    logic fill_request_pending;
     logic writeback_pending;
     logic writeback_complete;
-    logic writeback_queue_almost_full;
-    logic load_queue_almost_full;
+    logic writeback_fifo_almost_full;
+    logic fill_queue_almost_full;
     bus_interface_state_t state_ff;
     bus_interface_state_t state_nxt;
     logic[BURST_OFFSET_WIDTH - 1:0] burst_offset_ff;
     logic[BURST_OFFSET_WIDTH - 1:0] burst_offset_nxt;
-    logic[`AXI_DATA_WIDTH - 1:0] bif_load_buffer[0:BURST_BEATS - 1];
+    logic[`AXI_DATA_WIDTH - 1:0] fill_buffer[0:BURST_BEATS - 1];
     logic restart_flush_request;
-    logic load_dequeue_en;
+    logic fill_dequeue_en;
     l2req_packet_t lmq_out_request;
-    writeback_queue_entry_t writeback_queue_in;
-    writeback_queue_entry_t writeback_queue_out;
+    writeback_fifo_entry_t writeback_fifo_in;
+    writeback_fifo_entry_t writeback_fifo_out;
 
     assign miss_addr = l2r_request.address;
     assign enqueue_writeback_request = l2r_request_valid && l2r_needs_writeback
-        && ((l2r_request.packet_type == L2REQ_FLUSH && l2r_cache_hit && !l2r_is_restarted_flush)
-        || l2r_is_l2_fill);
-    assign enqueue_load_request = l2r_request_valid && !l2r_cache_hit && !l2r_is_l2_fill
+        && ((l2r_request.packet_type == L2REQ_FLUSH && l2r_cache_hit && !l2r_restarted_flush)
+        || l2r_l2_fill);
+    assign enqueue_fill_request = l2r_request_valid && !l2r_cache_hit && !l2r_l2_fill
         && (l2r_request.packet_type == L2REQ_LOAD
         || l2r_request.packet_type == L2REQ_STORE
         || l2r_request.packet_type == L2REQ_LOAD_SYNC
         || l2r_request.packet_type == L2REQ_STORE_SYNC);
-    assign writeback_pending = !writeback_queue_empty;
-    assign load_request_pending = !load_queue_empty;
+    assign writeback_pending = !writeback_fifo_empty;
+    assign fill_request_pending = !fill_queue_empty;
 
     l2_cache_pending_miss_cam l2_cache_pending_miss_cam(
         .request_valid(l2r_request_valid),
         .request_addr({miss_addr.tag, miss_addr.set_idx}),
         .*);
 
-    assign l2bi_perf_l2_writeback = enqueue_writeback_request && !writeback_queue_almost_full;
-
-    assign writeback_queue_in.address = {l2r_writeback_tag, miss_addr.set_idx}; // Old address
-    assign writeback_queue_in.data = l2r_data; // Old line to writeback
-    assign writeback_queue_in.is_flush = l2r_request.packet_type == L2REQ_FLUSH;
-    assign writeback_queue_in.core = l2r_request.core;
-    assign writeback_queue_in.id = l2r_request.id;
+    assign writeback_fifo_in.address = {l2r_writeback_tag, miss_addr.set_idx}; // Old address
+    assign writeback_fifo_in.data = l2r_data; // Old line to writeback
+    assign writeback_fifo_in.flush = l2r_request.packet_type == L2REQ_FLUSH;
+    assign writeback_fifo_in.core = l2r_request.core;
+    assign writeback_fifo_in.id = l2r_request.id;
 
     sync_fifo #(
-        .WIDTH($bits(writeback_queue_entry_t)),
-        .SIZE(REQUEST_QUEUE_LENGTH),
-        .ALMOST_FULL_THRESHOLD(REQUEST_QUEUE_LENGTH - L2REQ_LATENCY)
-    ) sync_fifo_pending_writeback(
+        .WIDTH($bits(writeback_fifo_entry_t)),
+        .SIZE(FIFO_SIZE),
+        .ALMOST_FULL_THRESHOLD(FIFO_SIZE - L2REQ_LATENCY)
+    ) pending_writeback_fifo(
         .clk(clk),
         .reset(reset),
         .flush_en(1'b0),
-        .almost_full(writeback_queue_almost_full),
+        .almost_full(writeback_fifo_almost_full),
         .enqueue_en(enqueue_writeback_request),
-        .value_i(writeback_queue_in),
+        .enqueue_value(writeback_fifo_in),
         .almost_empty(),
-        .empty(writeback_queue_empty),
+        .empty(writeback_fifo_empty),
         .dequeue_en(writeback_complete),
-        .value_o(writeback_queue_out),
+        .dequeue_value(writeback_fifo_out),
         .full(/* ignore */));
 
-    assign bif_writeback_address = writeback_queue_out.address;
-    assign bif_writeback_data = writeback_queue_out.data;
+    assign writeback_address = writeback_fifo_out.address;
+    assign writeback_data = writeback_fifo_out.data;
 
     sync_fifo #(
         .WIDTH($bits(l2req_packet_t) + 1),
-        .SIZE(REQUEST_QUEUE_LENGTH),
-        .ALMOST_FULL_THRESHOLD(REQUEST_QUEUE_LENGTH - L2REQ_LATENCY)
-    ) sync_fifo_pending_load(
+        .SIZE(FIFO_SIZE),
+        .ALMOST_FULL_THRESHOLD(FIFO_SIZE - L2REQ_LATENCY)
+    ) pending_fill_fifo(
         .clk(clk),
         .reset(reset),
         .flush_en(1'b0),
-        .almost_full(load_queue_almost_full),
-        .enqueue_en(enqueue_load_request),
-        .value_i({duplicate_request, l2r_request}),
-        .empty(load_queue_empty),
+        .almost_full(fill_queue_almost_full),
+        .enqueue_en(enqueue_fill_request),
+        .enqueue_value({duplicate_request, l2r_request}),
+        .empty(fill_queue_empty),
         .almost_empty(),
-        .dequeue_en(load_dequeue_en),
-        .value_o({l2bi_collided_miss, lmq_out_request}),
+        .dequeue_en(fill_dequeue_en),
+        .dequeue_value({l2bi_collided_miss, lmq_out_request}),
         .full(/* ignore */));
 
     // Stop accepting new L2 packets until space is available in the queues
-    assign l2bi_stall = load_queue_almost_full || writeback_queue_almost_full;
+    assign l2bi_stall = fill_queue_almost_full || writeback_fifo_almost_full;
 
     // AMBA AXI and ACE Protocol Specification, rev E, A3.4.1:
     // length field is is burst length - 1
     assign axi_bus.m_awlen = 8'(BURST_BEATS - 1);
     assign axi_bus.m_arlen = 8'(BURST_BEATS - 1);
     assign axi_bus.m_bready = 1'b1;
-
-    // ibid, Table A3-2
-    assign axi_bus.m_arsize = `AXI_DATA_WIDTH == 1 ? 3'd0 : 3'($clog2(`AXI_DATA_WIDTH / 8));
-    assign axi_bus.m_awsize = axi_bus.m_arsize;
-
-    assign axi_bus.m_awburst = AXI_BURST_INCR;
-    assign axi_bus.m_arburst = AXI_BURST_INCR;
-    assign axi_bus.m_wstrb = {(`AXI_DATA_WIDTH / 8){1'b1}};
-
-    // ibid, Table A4-3/A4-4
-    assign axi_bus.m_awcache = 4'b0010;    // Allocate, Modifiable, Not-Bufferable
-    assign axi_bus.m_arcache = 4'b0010;
+    assign axi_bus.m_awprot = 3'b000;
+    assign axi_bus.m_arprot = 3'b000;
+    assign axi_bus.m_aclk = clk;
+    assign axi_bus.m_aresetn = !reset;
 
     // Flatten array
-    genvar load_buffer_idx;
+    genvar fill_buffer_idx;
     generate
-        for (load_buffer_idx = 0; load_buffer_idx < BURST_BEATS; load_buffer_idx++)
+        for (fill_buffer_idx = 0; fill_buffer_idx < BURST_BEATS; fill_buffer_idx++)
         begin : mem_lane_gen
-            assign l2bi_data_from_memory[load_buffer_idx * `AXI_DATA_WIDTH+:`AXI_DATA_WIDTH]
-                = bif_load_buffer[BURST_BEATS - load_buffer_idx - 1];
+            assign l2bi_data_from_memory[fill_buffer_idx * `AXI_DATA_WIDTH+:`AXI_DATA_WIDTH]
+                = fill_buffer[BURST_BEATS - fill_buffer_idx - 1];
         end
     endgenerate
 
@@ -211,7 +205,7 @@ module l2_axi_bus_interface(
     always_comb
     begin
         state_nxt = state_ff;
-        load_dequeue_en = 0;
+        fill_dequeue_en = 0;
         burst_offset_nxt = burst_offset_ff;
         writeback_complete = 0;
         restart_flush_request = 0;
@@ -227,7 +221,7 @@ module l2_axi_bus_interface(
                     if (!wait_axi_write_response)
                         state_nxt = STATE_WRITE_ISSUE_ADDRESS;
                 end
-                else if (load_request_pending)
+                else if (fill_request_pending)
                 begin
                     if (l2bi_collided_miss
                         || (lmq_out_request.store_mask == {CACHE_LINE_BYTES{1'b1}}
@@ -266,7 +260,7 @@ module l2_axi_bus_interface(
                     if (burst_offset_ff == {BURST_OFFSET_WIDTH{1'b1}})
                     begin
                         writeback_complete = 1;
-                        restart_flush_request = writeback_queue_out.is_flush;
+                        restart_flush_request = writeback_fifo_out.flush;
                         state_nxt = STATE_IDLE;
                     end
 
@@ -296,7 +290,7 @@ module l2_axi_bus_interface(
             begin
                 // Push the response back into the L2 pipeline
                 state_nxt = STATE_IDLE;
-                load_dequeue_en = 1'b1;
+                fill_dequeue_en = 1'b1;
             end
         endcase
     end
@@ -305,8 +299,8 @@ module l2_axi_bus_interface(
     generate
         for (writeback_lane = 0; writeback_lane < BURST_BEATS; writeback_lane++)
         begin : writeback_lane_gen
-            assign bif_writeback_lanes[writeback_lane] = bif_writeback_data[writeback_lane * `AXI_DATA_WIDTH+:
-                `AXI_DATA_WIDTH];
+            assign writeback_lanes[writeback_lane] = writeback_data[
+                writeback_lane * `AXI_DATA_WIDTH+:`AXI_DATA_WIDTH];
         end
     endgenerate
 
@@ -320,12 +314,12 @@ module l2_axi_bus_interface(
             // the load_reuqest fields.
             l2bi_request_valid = 1'b1;
             l2bi_request.packet_type = L2REQ_FLUSH;
-            l2bi_request.core = writeback_queue_out.core;
-            l2bi_request.id = writeback_queue_out.id;
+            l2bi_request.core = writeback_fifo_out.core;
+            l2bi_request.id = writeback_fifo_out.id;
             l2bi_request.cache_type = CT_DCACHE;
         end
         else
-            l2bi_request_valid = load_dequeue_en;
+            l2bi_request_valid = fill_dequeue_en;
     end
 
     always_ff @(posedge clk, posedge reset)
@@ -341,6 +335,7 @@ module l2_axi_bus_interface(
             axi_bus.m_wlast <= '0;
             axi_bus.m_wvalid <= '0;
             burst_offset_ff <= '0;
+            l2bi_perf_l2_writeback <= '0;
             wait_axi_write_response <= '0;
             // End of automatics
         end
@@ -361,18 +356,19 @@ module l2_axi_bus_interface(
             axi_bus.m_awvalid <= state_nxt == STATE_WRITE_ISSUE_ADDRESS;
             axi_bus.m_wvalid <= state_nxt == STATE_WRITE_TRANSFER;
             axi_bus.m_wlast <= state_nxt == STATE_WRITE_TRANSFER
-                && axi_bus.s_wready
-                && burst_offset_ff == BURST_OFFSET_WIDTH'(BURST_BEATS - 2);
+                && burst_offset_nxt == BURST_OFFSET_WIDTH'(BURST_BEATS - 1);
+            l2bi_perf_l2_writeback <= enqueue_writeback_request
+                && !writeback_fifo_almost_full;
         end
     end
 
     always_ff @(posedge clk)
     begin
         if (state_ff == STATE_READ_TRANSFER && axi_bus.s_rvalid)
-            bif_load_buffer[burst_offset_ff] <= axi_bus.s_rdata;
+            fill_buffer[burst_offset_ff] <= axi_bus.s_rdata;
 
         axi_bus.m_araddr <= {l2bi_request.address, {CACHE_LINE_OFFSET_WIDTH{1'b0}}};
-        axi_bus.m_awaddr <= {bif_writeback_address, {CACHE_LINE_OFFSET_WIDTH{1'b0}}};
-        axi_bus.m_wdata <= bif_writeback_lanes[~burst_offset_nxt];
+        axi_bus.m_awaddr <= {writeback_address, {CACHE_LINE_OFFSET_WIDTH{1'b0}}};
+        axi_bus.m_wdata <= writeback_lanes[~burst_offset_nxt];
     end
 endmodule

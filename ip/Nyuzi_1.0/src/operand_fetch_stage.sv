@@ -14,7 +14,7 @@
 // limitations under the License.
 //
 
-`include "defines.sv"
+`include "defines.svh"
 
 import defines::*;
 
@@ -36,7 +36,7 @@ module operand_fetch_stage(
     // To fp_execute_stage1/int_execute_stage/dcache_tag_stage
     output vector_t                   of_operand1,
     output vector_t                   of_operand2,
-    output vector_lane_mask_t         of_mask_value,
+    output vector_mask_t              of_mask_value,
     output vector_t                   of_store_value,
     output decoded_instruction_t      of_instruction,
     output logic                      of_instruction_valid,
@@ -48,9 +48,9 @@ module operand_fetch_stage(
     input local_thread_idx_t          wb_rollback_thread_idx,
     input                             wb_writeback_en,
     input local_thread_idx_t          wb_writeback_thread_idx,
-    input                             wb_writeback_is_vector,
+    input                             wb_writeback_vector,
     input vector_t                    wb_writeback_value,
-    input vector_lane_mask_t          wb_writeback_mask,
+    input vector_mask_t               wb_writeback_mask,
     input register_idx_t              wb_writeback_reg);
 
     scalar_t scalar_val1;
@@ -69,7 +69,7 @@ module operand_fetch_stage(
         .read2_en(ts_instruction_valid && ts_instruction.has_scalar2),
         .read2_addr({ts_thread_idx, ts_instruction.scalar_sel2}),
         .read2_data(scalar_val2),
-        .write_en(wb_writeback_en && !wb_writeback_is_vector),
+        .write_en(wb_writeback_en && !wb_writeback_vector),
         .write_addr({wb_writeback_thread_idx, wb_writeback_reg}),
         .write_data(wb_writeback_value[0]),
         .*);
@@ -89,7 +89,7 @@ module operand_fetch_stage(
                 .read2_en(ts_instruction.has_vector2),
                 .read2_addr({ts_thread_idx, ts_instruction.vector_sel2}),
                 .read2_data(vector_val2[lane]),
-                .write_en(wb_writeback_en && wb_writeback_is_vector && wb_writeback_mask[NUM_VECTOR_LANES - lane - 1]),
+                .write_en(wb_writeback_en && wb_writeback_vector && wb_writeback_mask[NUM_VECTOR_LANES - lane - 1]),
                 .write_addr({wb_writeback_thread_idx, wb_writeback_reg}),
                 .write_data(wb_writeback_value[lane]),
                 .*);
@@ -114,24 +114,24 @@ module operand_fetch_stage(
         of_subcycle <= ts_subcycle;
     end
 
-    assign of_store_value = of_instruction.store_value_is_vector
+    assign of_store_value = of_instruction.store_value_vector
             ? vector_val2
             : {{NUM_VECTOR_LANES - 1{32'd0}}, scalar_val2};
 
     always_comb
     begin
-        case (of_instruction.op1_src)
+        unique case (of_instruction.op1_src)
             OP1_SRC_VECTOR1: of_operand1 = vector_val1;
             default:         of_operand1 = {NUM_VECTOR_LANES{scalar_val1}};    // OP_SRC_SCALAR1
         endcase
 
-        case (of_instruction.op2_src)
+        unique case (of_instruction.op2_src)
             OP2_SRC_SCALAR2: of_operand2 = {NUM_VECTOR_LANES{scalar_val2}};
             OP2_SRC_VECTOR2: of_operand2 = vector_val2;
             default:         of_operand2 = {NUM_VECTOR_LANES{of_instruction.immediate_value}}; // OP2_SRC_IMMEDIATE
         endcase
 
-        case (of_instruction.mask_src)
+        unique case (of_instruction.mask_src)
             MASK_SRC_SCALAR1: of_mask_value = scalar_val1[NUM_VECTOR_LANES - 1:0];
             MASK_SRC_SCALAR2: of_mask_value = scalar_val2[NUM_VECTOR_LANES - 1:0];
             default:          of_mask_value = {NUM_VECTOR_LANES{1'b1}};    // MASK_SRC_ALL_ONES
